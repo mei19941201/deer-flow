@@ -39,7 +39,7 @@ markers = [
 ]
 
 [tool.uv]
-index-url = "https://pypi.org/simple"
+index-url = "https://mirrors.aliyun.com/pypi/simple/"
 
 [tool.uv.workspace]
 members = ["packages/harness"]
