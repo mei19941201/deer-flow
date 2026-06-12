@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from datetime import datetime
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -11,6 +10,7 @@ from deerflow.config.agents_config import load_agent_soul
 from deerflow.skills.storage import get_or_new_skill_storage
 from deerflow.skills.types import Skill, SkillCategory
 from deerflow.subagents import get_available_subagent_names
+from deerflow.tools.builtins.tool_search import get_deferred_tools_prompt_section
 
 if TYPE_CHECKING:
     from deerflow.config.app_config import AppConfig
@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 _ENABLED_SKILLS_REFRESH_WAIT_TIMEOUT_SECONDS = 5.0
 _enabled_skills_lock = threading.Lock()
 _enabled_skills_cache: list[Skill] | None = None
+_enabled_skills_by_config_cache: dict[int, tuple[object, list[Skill]]] = {}
 _enabled_skills_refresh_active = False
 _enabled_skills_refresh_version = 0
 _enabled_skills_refresh_event = threading.Event()
@@ -84,6 +85,7 @@ def _invalidate_enabled_skills_cache() -> threading.Event:
     _get_cached_skills_prompt_section.cache_clear()
     with _enabled_skills_lock:
         _enabled_skills_cache = None
+        _enabled_skills_by_config_cache.clear()
         _enabled_skills_refresh_version += 1
         _enabled_skills_refresh_event.clear()
         if _enabled_skills_refresh_active:
@@ -107,6 +109,15 @@ def warm_enabled_skills_cache(timeout_seconds: float = _ENABLED_SKILLS_REFRESH_W
 
 
 def _get_enabled_skills():
+    return get_cached_enabled_skills()
+
+
+def get_cached_enabled_skills() -> list[Skill]:
+    """Return the cached enabled-skills list, kicking off a background refresh on miss.
+
+    Safe to call from request paths: never blocks on disk I/O. Returns an empty
+    list on cache miss; the next call will see the warmed result.
+    """
     with _enabled_skills_lock:
         cached = _enabled_skills_cache
 
@@ -117,17 +128,29 @@ def _get_enabled_skills():
     return []
 
 
-def _get_enabled_skills_for_config(app_config: AppConfig | None = None) -> list[Skill]:
+def get_enabled_skills_for_config(app_config: AppConfig | None = None) -> list[Skill]:
     """Return enabled skills using the caller's config source.
 
-    When a concrete ``app_config`` is supplied, bypass the global enabled-skills
-    cache so the skill list and skill paths are resolved from the same config
-    object. This keeps request-scoped config injection consistent even while the
-    release branch still supports global fallback paths.
+    When a concrete ``app_config`` is supplied, cache the loaded skills by that
+    config object's identity so request-scoped config injection still resolves
+    skill paths from the matching config without rescanning storage on every
+    agent factory call.
     """
     if app_config is None:
         return _get_enabled_skills()
-    return list(get_or_new_skill_storage(app_config=app_config).load_skills(enabled_only=True))
+
+    cache_key = id(app_config)
+    with _enabled_skills_lock:
+        cached = _enabled_skills_by_config_cache.get(cache_key)
+        if cached is not None:
+            cached_config, cached_skills = cached
+            if cached_config is app_config:
+                return list(cached_skills)
+
+    skills = list(get_or_new_skill_storage(app_config=app_config).load_skills(enabled_only=True))
+    with _enabled_skills_lock:
+        _enabled_skills_by_config_cache[cache_key] = (app_config, skills)
+    return list(skills)
 
 
 def _skill_mutability_label(category: SkillCategory | str) -> str:
@@ -345,8 +368,6 @@ You are {agent_name}, an open-source super agent.
 
 {soul}
 {self_update_section}
-{memory_context}
-
 <thinking_style>
 - Think concisely and strategically about the user's request BEFORE taking action
 - Break down the task: What is clear? What is ambiguous? What is missing?
@@ -522,6 +543,14 @@ combined with a FastAPI gateway for REST API access [citation:FastAPI](https://f
 {subagent_reminder}- Skill First: Always load the relevant skill before starting **complex** tasks.
 - Progressive Loading: Load resources incrementally as referenced in skills
 - Output Files: Final deliverables must be in `/mnt/user-data/outputs`
+- File Editing Workflow: When revising an existing file, prefer
+  `str_replace` over `write_file` — it sends only the diff and avoids
+  re-emitting the whole file (mirrors Claude Code's Edit and Codex's
+  apply_patch). When writing long new content from scratch, split it
+  into sections: the first `write_file` call creates the file, then use
+  `write_file` with append=True to extend it section by section. This
+  keeps each tool call small and avoids mid-stream chunk-gap timeouts
+  on oversized single-shot writes. (See issue #3189.)  
 - Clarity: Be direct and helpful, avoid unnecessary meta-commentary
 - Including Images and Mermaid: Images and Mermaid diagrams are always welcomed in the Markdown format, and you're encouraged to use `![Image Description](image_path)\n\n` or "```mermaid" to display images in response or Markdown files
 - Multi-task: Better utilize parallel tool calling to call multiple tools at one time for better performance
@@ -557,7 +586,11 @@ def _get_memory_context(agent_name: str | None = None, *, app_config: AppConfig 
             return ""
 
         memory_data = get_memory_data(agent_name, user_id=get_effective_user_id())
-        memory_content = format_memory_for_injection(memory_data, max_tokens=config.max_injection_tokens)
+        memory_content = format_memory_for_injection(
+            memory_data,
+            max_tokens=config.max_injection_tokens,
+            use_tiktoken=(config.token_counting == "tiktoken"),
+        )
 
         if not memory_content.strip():
             return ""
@@ -596,6 +629,11 @@ You have access to skills that provide optimized workflows for specific tasks. E
 4. Load referenced resources only when needed during execution
 5. Follow the skill's instructions precisely
 
+**Explicit Slash Skill Activation:**
+- If the user starts a request with `/<skill-name>`, that skill was explicitly requested for the current turn.
+- Follow the activated skill before choosing a general workflow.
+- The runtime injects the activated skill content for explicit slash activations; do not call `read_file` for that SKILL.md again unless the injected skill references supporting resources you need.
+
 **Skills are located at:** {container_base_path}
 {skill_evolution_section}
 {skills_list}
@@ -605,7 +643,7 @@ You have access to skills that provide optimized workflows for specific tasks. E
 
 def get_skills_prompt_section(available_skills: set[str] | None = None, *, app_config: AppConfig | None = None) -> str:
     """Generate the skills prompt section with available skills list."""
-    skills = _get_enabled_skills_for_config(app_config)
+    skills = get_enabled_skills_for_config(app_config)
 
     if app_config is None:
         try:
@@ -658,40 +696,11 @@ SOUL.md or config.yaml — those write into a temporary sandbox/tool workspace a
 Rules:
 - Always pass the FULL replacement text for `soul` (no patch semantics). Start from your current SOUL above and apply the user's edits.
 - Only pass the fields that should change. Omit the others to preserve them.
+- Never pass literal strings like `"null"`, `"none"`, or `"undefined"` for unchanged fields.
 - Pass `skills=[]` to disable all skills, or omit `skills` to keep the existing whitelist.
 - After `update_agent` returns successfully, tell the user the change is persisted and will take effect on the next turn.
 </self_update>
 """
-
-
-def get_deferred_tools_prompt_section(*, app_config: AppConfig | None = None) -> str:
-    """Generate <available-deferred-tools> block for the system prompt.
-
-    Lists only deferred tool names so the agent knows what exists
-    and can use tool_search to load them.
-    Returns empty string when tool_search is disabled or no tools are deferred.
-    """
-    from deerflow.tools.builtins.tool_search import get_deferred_registry
-
-    if app_config is None:
-        try:
-            from deerflow.config import get_app_config
-
-            config = get_app_config()
-        except Exception:
-            return ""
-    else:
-        config = app_config
-
-    if not config.tool_search.enabled:
-        return ""
-
-    registry = get_deferred_registry()
-    if not registry:
-        return ""
-
-    names = "\n".join(e.name for e in registry.entries)
-    return f"<available-deferred-tools>\n{names}\n</available-deferred-tools>"
 
 
 def _build_acp_section(*, app_config: AppConfig | None = None) -> str:
@@ -752,10 +761,8 @@ def apply_prompt_template(
     agent_name: str | None = None,
     available_skills: set[str] | None = None,
     app_config: AppConfig | None = None,
+    deferred_names: frozenset[str] = frozenset(),
 ) -> str:
-    # Get memory context
-    memory_context = _get_memory_context(agent_name, app_config=app_config)
-
     # Include subagent section only if enabled (from runtime parameter)
     n = max_concurrent_subagents
     subagent_section = _build_subagent_section(n, app_config=app_config) if subagent_enabled else ""
@@ -782,25 +789,25 @@ def apply_prompt_template(
     skills_section = get_skills_prompt_section(available_skills, app_config=app_config)
 
     # Get deferred tools section (tool_search)
-    deferred_tools_section = get_deferred_tools_prompt_section(app_config=app_config)
+    deferred_tools_section = get_deferred_tools_prompt_section(deferred_names=deferred_names)
 
     # Build ACP agent section only if ACP agents are configured
     acp_section = _build_acp_section(app_config=app_config)
     custom_mounts_section = _build_custom_mounts_section(app_config=app_config)
     acp_and_mounts_section = "\n".join(section for section in (acp_section, custom_mounts_section) if section)
 
-    # Format the prompt with dynamic skills and memory
-    prompt = SYSTEM_PROMPT_TEMPLATE.format(
+    # Build and return the fully static system prompt.
+    # Memory and current date are injected per-turn via DynamicContextMiddleware
+    # as a <system-reminder> in the first HumanMessage, keeping this prompt
+    # identical across users and sessions for maximum prefix-cache reuse.
+    return SYSTEM_PROMPT_TEMPLATE.format(
         agent_name=agent_name or "DeerFlow 2.0",
         soul=get_agent_soul(agent_name),
         self_update_section=_build_self_update_section(agent_name),
         skills_section=skills_section,
         deferred_tools_section=deferred_tools_section,
-        memory_context=memory_context,
         subagent_section=subagent_section,
         subagent_reminder=subagent_reminder,
         subagent_thinking=subagent_thinking,
         acp_section=acp_and_mounts_section,
     )
-
-    return prompt + f"\n<current_date>{datetime.now().strftime('%Y-%m-%d, %A')}</current_date>"

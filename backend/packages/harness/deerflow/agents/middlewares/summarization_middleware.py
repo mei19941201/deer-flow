@@ -9,10 +9,14 @@ from typing import Any, Protocol, override, runtime_checkable
 
 from langchain.agents import AgentState
 from langchain.agents.middleware import SummarizationMiddleware
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage, ToolMessage
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage, ToolMessage, get_buffer_string
 from langgraph.config import get_config
+from langgraph.constants import TAG_NOSTREAM
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
+
+from deerflow.agents.middlewares.dynamic_context_middleware import is_dynamic_context_reminder
+from deerflow.agents.middlewares.tool_call_metadata import clone_ai_message_with_tool_calls
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +82,7 @@ def _clone_ai_message(
     content: Any | None = None,
 ) -> AIMessage:
     """Clone an AIMessage while replacing its tool_calls list and optional content."""
-    update: dict[str, Any] = {"tool_calls": tool_calls}
-    if content is not None:
-        update["content"] = content
-    return message.model_copy(update=update)
+    return clone_ai_message_with_tool_calls(message, tool_calls, content=content)
 
 
 @dataclass
@@ -116,6 +117,74 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         self._preserve_recent_skill_count = max(0, preserve_recent_skill_count)
         self._preserve_recent_skill_tokens = max(0, preserve_recent_skill_tokens)
         self._preserve_recent_skill_tokens_per_skill = max(0, preserve_recent_skill_tokens_per_skill)
+        # The summary LLM call runs inside a LangGraph middleware hook, so its token
+        # stream would otherwise be captured by the messages-tuple stream callback and
+        # broadcast to the frontend as a phantom AI message. Tag a dedicated model copy
+        # with TAG_NOSTREAM so the streaming handler skips it.
+        # Keep self.model untagged so the parent's profile / ls_params inspection still works.
+        #
+        # Preserve any tags already bound on the model (e.g. "middleware:summarize" set in
+        # lead_agent/agent.py for RunJournal attribution): RunnableBinding.with_config does a
+        # shallow merge that would otherwise overwrite the existing tags list entirely.
+        existing_tags = list((getattr(self.model, "config", None) or {}).get("tags") or [])
+        merged_tags = [*existing_tags, TAG_NOSTREAM] if TAG_NOSTREAM not in existing_tags else existing_tags
+        self._summary_model = self.model.with_config(tags=merged_tags)
+
+    @override
+    def _create_summary(self, messages_to_summarize: list[AnyMessage]) -> str:
+        return self._summarize_with(messages_to_summarize)
+
+    @override
+    async def _acreate_summary(self, messages_to_summarize: list[AnyMessage]) -> str:
+        return await self._asummarize_with(messages_to_summarize)
+
+    def _summarize_with(self, messages_to_summarize: list[AnyMessage]) -> str:
+        """Mirror the parent ``_create_summary`` but invoke the nostream-tagged model.
+
+        We do not swap ``self.model`` at the instance level: the agent/middleware is
+        cached and reused across concurrent runs, so a temporary swap would leak the
+        ``RunnableBinding`` to other coroutines during ``await`` and break parent logic
+        that inspects the raw model (``profile`` / ``_get_ls_params``).
+        """
+        if not messages_to_summarize:
+            return "No previous conversation history."
+        prompt = self._build_summary_prompt(messages_to_summarize)
+        if prompt is None:
+            return "Previous conversation was too long to summarize."
+        try:
+            response = self._summary_model.invoke(
+                prompt,
+                config={"metadata": {"lc_source": "summarization"}},
+            )
+            return response.text.strip()
+        except Exception as e:
+            return f"Error generating summary: {e!s}"
+
+    async def _asummarize_with(self, messages_to_summarize: list[AnyMessage]) -> str:
+        """Async counterpart of :meth:`_summarize_with` using the nostream model."""
+        if not messages_to_summarize:
+            return "No previous conversation history."
+        prompt = self._build_summary_prompt(messages_to_summarize)
+        if prompt is None:
+            return "Previous conversation was too long to summarize."
+        try:
+            response = await self._summary_model.ainvoke(
+                prompt,
+                config={"metadata": {"lc_source": "summarization"}},
+            )
+            return response.text.strip()
+        except Exception as e:
+            return f"Error generating summary: {e!s}"
+
+    def _build_summary_prompt(self, messages_to_summarize: list[AnyMessage]) -> str | None:
+        """Build the summary prompt, returning ``None`` when trimming leaves nothing."""
+        trimmed_messages = self._trim_messages_for_summary(messages_to_summarize)
+        if not trimmed_messages:
+            return None
+        # Format messages to avoid token inflation from metadata when str() is called on
+        # message objects.
+        formatted_messages = get_buffer_string(trimmed_messages)
+        return self.summary_prompt.format(messages=formatted_messages).rstrip()
 
     def before_model(self, state: AgentState, runtime: Runtime) -> dict | None:
         return self._maybe_summarize(state, runtime)
@@ -136,6 +205,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             return None
 
         messages_to_summarize, preserved_messages = self._partition_with_skill_rescue(messages, cutoff_index)
+        messages_to_summarize, preserved_messages = self._preserve_dynamic_context_reminders(messages_to_summarize, preserved_messages)
         self._fire_hooks(messages_to_summarize, preserved_messages, runtime)
         summary = self._create_summary(messages_to_summarize)
         new_messages = self._build_new_messages(summary)
@@ -161,6 +231,7 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
             return None
 
         messages_to_summarize, preserved_messages = self._partition_with_skill_rescue(messages, cutoff_index)
+        messages_to_summarize, preserved_messages = self._preserve_dynamic_context_reminders(messages_to_summarize, preserved_messages)
         self._fire_hooks(messages_to_summarize, preserved_messages, runtime)
         summary = await self._acreate_summary(messages_to_summarize)
         new_messages = self._build_new_messages(summary)
@@ -179,6 +250,24 @@ class DeerFlowSummarizationMiddleware(SummarizationMiddleware):
         And this message will be ignored to display in the frontend, but still can be used as context for the model.
         """
         return [HumanMessage(content=f"Here is a summary of the conversation to date:\n\n{summary}", name="summary")]
+
+    def _preserve_dynamic_context_reminders(
+        self,
+        messages_to_summarize: list[AnyMessage],
+        preserved_messages: list[AnyMessage],
+    ) -> tuple[list[AnyMessage], list[AnyMessage]]:
+        """Keep hidden dynamic-context reminders out of summary compression.
+
+        These reminders carry the current date and optional memory. If summarization
+        removes them, DynamicContextMiddleware can mistake the summary HumanMessage
+        for the first user message and inject the reminder in the wrong place.
+        """
+        reminders = [msg for msg in messages_to_summarize if is_dynamic_context_reminder(msg)]
+        if not reminders:
+            return messages_to_summarize, preserved_messages
+
+        remaining = [msg for msg in messages_to_summarize if not is_dynamic_context_reminder(msg)]
+        return remaining, reminders + preserved_messages
 
     def _partition_with_skill_rescue(
         self,

@@ -21,6 +21,8 @@ import logging
 
 import requests
 
+from deerflow.runtime.user_context import get_effective_user_id
+
 from .backend import SandboxBackend
 from .sandbox_info import SandboxInfo
 
@@ -57,7 +59,7 @@ class RemoteSandboxBackend(SandboxBackend):
 
     def create(
         self,
-        thread_id: str,
+        thread_id: str | None,
         sandbox_id: str,
         extra_mounts: list[tuple[str, str, bool]] | None = None,
     ) -> SandboxInfo:
@@ -130,7 +132,7 @@ class RemoteSandboxBackend(SandboxBackend):
             logger.warning("Provisioner list_running failed: %s", exc)
             return []
 
-    def _provisioner_create(self, thread_id: str, sandbox_id: str, extra_mounts: list[tuple[str, str, bool]] | None = None) -> SandboxInfo:
+    def _provisioner_create(self, thread_id: str | None, sandbox_id: str, extra_mounts: list[tuple[str, str, bool]] | None = None) -> SandboxInfo:
         """POST /api/sandboxes → create Pod + Service."""
         try:
             resp = requests.post(
@@ -138,6 +140,7 @@ class RemoteSandboxBackend(SandboxBackend):
                 json={
                     "sandbox_id": sandbox_id,
                     "thread_id": thread_id,
+                    "user_id": get_effective_user_id(),
                 },
                 timeout=30,
             )
@@ -173,12 +176,16 @@ class RemoteSandboxBackend(SandboxBackend):
                 f"{self._provisioner_url}/api/sandboxes/{sandbox_id}",
                 timeout=10,
             )
-            if resp.ok:
-                data = resp.json()
-                return data.get("status") == "Running"
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Provisioner health check failed for {sandbox_id}: {exc}") from exc
+
+        if resp.status_code == 404:
             return False
-        except requests.RequestException:
-            return False
+        if not resp.ok:
+            raise RuntimeError(f"Provisioner health check failed for {sandbox_id}: HTTP {resp.status_code} {resp.text}")
+
+        data = resp.json()
+        return data.get("status") == "Running"
 
     def _provisioner_discover(self, sandbox_id: str) -> SandboxInfo | None:
         """GET /api/sandboxes/{sandbox_id} → discover existing sandbox."""
